@@ -2,7 +2,7 @@
 
 ![Current high-level design](hld.png)
 
-BookMyShow is one Spring Boot process. `BookingApplication` creates two sample theaters and their showtimes at startup. Spring MVC routes HTTP requests to four controllers. Booking and payment services operate on in-memory state. Card and UPI gateways are simulations. Only the optional booking event publisher connects to an external service (Amazon SQS).
+BookMyShow is one Spring Boot process. Theater and showtime catalog data are loaded from the configured database; booking records and seat inventory are persisted there as well. Spring MVC routes HTTP requests to the controllers. Payment records and idempotency slots remain in memory; card and UPI gateways are simulations. Only the optional booking event publisher connects to an external service (Amazon SQS).
 
 ```mermaid
 flowchart TB
@@ -17,13 +17,16 @@ flowchart TB
         end
         subgraph Services[Application services]
             BS[BookingSystem]
+            CatalogService[TheaterCatalogService]
+            SeatService[SeatBookingService]
             PS[PaymentService]
             TP[TicketPricingService]
         end
-        subgraph State[In-memory state]
+        subgraph State[Persisted and in-memory state]
             Catalog[Theater / Movie / Showtime catalog]
-            Seats[Showtime seat set + ReentrantLock]
-            Bookings[Reservations + idempotency slots]
+            Seats[Seat inventory]
+            Bookings[Booking records]
+            Idempotency[Idempotency slots (memory)]
             Payments[Payments by booking ID]
         end
         subgraph Adapters[Adapters]
@@ -36,8 +39,11 @@ flowchart TB
     MC & TC & BC --> BS
     BC & PC --> PS
     PS --> BS
-    BS --> Catalog & Seats & Bookings & PUB
+    BS --> CatalogService & SeatService & Idempotency & PUB
+    CatalogService --> Catalog
+    SeatService --> Seats & Bookings
     PS --> TP & Payments & GW
+    Catalog & Seats & Bookings --> DB[(H2 / PostgreSQL)]
     PUB -. configured queue .-> SQS
     MC & TC & BC & PC -. API errors .-> EH
 ```
@@ -48,9 +54,13 @@ flowchart TB
 | --- | --- | --- |
 | Movie search | `GET /v1/movies/search?title=&language=&city=` | Searches future showtimes through `BookingSystem.searchMovies`. Filters are optional. |
 | Theater search | `GET /v1/theaters/search?city=Mumbai` | Finds theaters in a city. |
+| Theater management | `GET/POST /v1/theaters` | Lists theaters or persists a new theater. |
 | Theater schedule | `GET /v1/theaters/{theaterId}/showtimes` | Lists future showtimes at a theater. |
-| Booking | `POST /v1/bookings` | Requires `Idempotency-Key`; reserves all requested seats under the showtime lock. |
+| Show management | `POST /v1/theaters/{theaterId}/showtimes` | Creates and persists a future showtime. |
+| Booking | `POST /v1/bookings` | Requires `Idempotency-Key`; reserves all requested seats in a database transaction. |
 | Quote and payment | `GET /v1/bookings/{id}/quote`, `POST /v1/bookings/{id}/payments` | Applies configured discounts and selects a simulated card or UPI gateway. |
 | Cancellation | `DELETE /v1/bookings/{id}` | Releases seats only for an unpaid booking. |
 
-The lock prevents two requests in this process from reserving the same seat. It does not coordinate multiple application instances. The proposed database constraints in [schema.md](schema.md) describe a future persistent design; they are not active in this application.
+`SeatBookingService` uses JPA pessimistic write locks on requested `SeatInventory` rows and `BookingRecord` during cancellation. `@Transactional` keeps each lock through its availability check and database updates. Theater/showtime catalog rows, seat inventory, and bookings are persisted; idempotency state and payments remain in memory.
+
+At startup, the `ApplicationRunner` calls `BookingSystem.initializeCatalog()`. `TheaterCatalogService` loads theater and showtime records, then `SeatBookingService` creates any missing inventory rows. Theater and show creation are supported; update/delete operations and staff authentication are not implemented.

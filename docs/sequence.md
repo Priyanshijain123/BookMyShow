@@ -12,7 +12,10 @@ sequenceDiagram
     participant API as BookingController
     participant BS as BookingSystem
     participant Slot as IdempotencySlot
-    participant Show as Showtime
+    participant Service as SeatBookingService
+    participant Seats as SeatInventoryRepository
+    participant Records as BookingRecordRepository
+    participant DB as Database
     participant Events as BookingEventPublisher
     Client->>API: POST /v1/bookings + Idempotency-Key
     API->>BS: book(showtimeId, seatIds, key)
@@ -23,16 +26,26 @@ sequenceDiagram
     else same key and different request
         BS-->>API: conflict
     else new key
-        BS->>Show: book(reservation)
-        Show->>Show: validate seats; tryLock(50 ms)
-        alt busy or seat conflict
-            Show-->>BS: error
+        BS->>Service: book(showtime, seatIds)
+        activate Service
+        Service->>Service: validate and sort seat IDs
+        Service->>Seats: lockSeats(showtimeId, seatIds)
+        Seats->>DB: SELECT requested seats FOR UPDATE
+        Note over Seats,DB: JPA PESSIMISTIC_WRITE locks the requested rows
+        DB-->>Seats: locked seat inventory
+        Seats-->>Service: seat entities
+        alt seat missing or already booked
+            Service-->>BS: error (transaction rolls back)
+            deactivate Service
             BS->>Slot: fail and remove key
-            BS-->>API: 503 busy or 409 conflict
+            BS-->>API: 400 invalid seat or 409 unavailable
         else seats available
-            Show->>Show: check and reserve under lock
-            Show-->>BS: booked
-            BS->>BS: save reservation in memory
+            Service->>Records: save BookingRecord
+            Service->>Seats: mark seats BOOKED
+            Service->>DB: commit booking and seat updates
+            DB-->>Service: commit
+            Service-->>BS: Reservation
+            deactivate Service
             BS->>Events: publish BOOKING_CREATED if SQS configured
             Note over BS,Events: Publish failure is logged; booking stays created
             BS->>Slot: completeSuccess(reservation)
@@ -42,6 +55,8 @@ sequenceDiagram
     end
 ```
 
+The seat-row locks and booking writes share the `@Transactional` boundary in `SeatBookingService.book()`. Overlapping requests wait on shared seat rows; after the first commits, the next request sees the booked state and fails, rolling back any other seats it requested.
+
 ## Quote and pay
 
 ```mermaid
@@ -50,11 +65,15 @@ sequenceDiagram
     participant API as BookingController / PaymentController
     participant PS as PaymentService
     participant BS as BookingSystem
+    participant Records as BookingRecordRepository
     participant Pricing as TicketPricingService
     participant Gateway as PaymentGateway
     Client->>API: GET /v1/bookings/{id}/quote
     API->>PS: quote(bookingId)
     PS->>BS: getReservation(bookingId)
+    BS->>Records: findById(bookingId)
+    Records-->>BS: active BookingRecord
+    BS-->>PS: Reservation
     PS->>Pricing: quote(reservation)
     Pricing-->>PS: PriceQuote
     PS-->>API: PriceQuote
@@ -81,16 +100,30 @@ sequenceDiagram
     participant API as BookingController
     participant PS as PaymentService
     participant BS as BookingSystem
-    participant Show as Showtime
+    participant Service as SeatBookingService
+    participant Bookings as BookingRecordRepository
+    participant Seats as SeatInventoryRepository
+    participant DB as Database
     Client->>API: DELETE /v1/bookings/{id}
     API->>PS: cancelUnpaidBooking(bookingId)
     alt payment exists
         PS-->>API: 409 refund required
     else unpaid
         PS->>BS: cancelReservation(bookingId)
-        BS->>Show: cancel(reservation)
-        Show->>Show: lock and release seats
-        BS->>BS: remove reservation
+        BS->>Service: cancel(bookingId)
+        activate Service
+        Service->>Bookings: lockByBookingId(bookingId)
+        Bookings->>DB: SELECT booking FOR UPDATE
+        DB-->>Bookings: active booking
+        Bookings-->>Service: BookingRecord
+        Service->>Seats: lockSeats(showtimeId, seatIds)
+        Seats->>DB: SELECT requested seats FOR UPDATE
+        DB-->>Seats: locked seats
+        Seats-->>Service: seat entities
+        Service->>Service: verify ownership; release seats; cancel booking
+        Service->>DB: commit cancellation and inventory update
+        DB-->>Service: commit
+        deactivate Service
         API-->>Client: 204 No Content
     end
 ```

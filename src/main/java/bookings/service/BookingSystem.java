@@ -3,13 +3,12 @@ import bookings.model.*;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -19,30 +18,37 @@ public class BookingSystem {
 
         private final List<Theater> theaters;
         private final BookingEventPublisher bookingEventPublisher;
+        private final SeatBookingService seatBookingService;
+        private final TheaterCatalogService theaterCatalogService;
         private final Map<String, Showtime> showtimesById;
-        private final Map<String, Reservation> reservationsById;
         private final Map<String, IdempotencySlot> bookingsByIdempotencyKey;
 
-        public BookingSystem(List<Theater> theaters) {
-            this(theaters, reservation -> { });
+        public BookingSystem(BookingEventPublisher bookingEventPublisher, SeatBookingService seatBookingService,
+                             TheaterCatalogService theaterCatalogService) {
+            this.theaters = new ArrayList<>();
+            this.bookingEventPublisher = Objects.requireNonNull(bookingEventPublisher);
+            this.seatBookingService = Objects.requireNonNull(seatBookingService);
+            this.theaterCatalogService = Objects.requireNonNull(theaterCatalogService);
+            this.showtimesById = new ConcurrentHashMap<>();
+            this.bookingsByIdempotencyKey = new ConcurrentHashMap<>();
         }
 
-        public BookingSystem(List<Theater> theaters, BookingEventPublisher bookingEventPublisher) {
-            this.theaters = theaters;
-            this.bookingEventPublisher = Objects.requireNonNull(bookingEventPublisher);
-            this.showtimesById = new HashMap<>();
-            this.reservationsById = new ConcurrentHashMap<>();
-            this.bookingsByIdempotencyKey = new ConcurrentHashMap<>();
-
-            for (Theater theater : theaters) {
+        public synchronized void initializeCatalog() {
+            if (!theaters.isEmpty()) {
+                return;
+            }
+            List<Theater> persistedTheaters = theaterCatalogService.loadCatalog();
+            theaters.addAll(persistedTheaters);
+            for (Theater theater : persistedTheaters) {
                 for (Showtime showtime : theater.getShowtimes()) {
                     showtimesById.put(showtime.getId(), showtime);
                 }
             }
+            seatBookingService.initializeInventory(persistedTheaters);
         }
 
 
-        public List<Showtime> searchMovies(String title, String language, String city) {
+        public synchronized List<Showtime> searchMovies(String title, String language, String city) {
             String titleFilter = normalize(title);
             String languageFilter = normalize(language);
             String cityFilter = normalize(city);
@@ -62,7 +68,7 @@ public class BookingSystem {
             return results;
         }
 
-        public List<Theater> searchTheaters(String city) {
+        public synchronized List<Theater> searchTheaters(String city) {
             String cityFilter = normalize(city);
             if (cityFilter.isEmpty()) {
                 throw new IllegalArgumentException("City is required");
@@ -77,11 +83,15 @@ public class BookingSystem {
             return results;
         }
 
+        public synchronized List<Theater> getTheaters() {
+            return new ArrayList<>(theaters);
+        }
+
         private String normalize(String value) {
             return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
         }
 
-        public List<Showtime> getShowtimesAtTheater(Theater theater) {
+        public synchronized List<Showtime> getShowtimesAtTheater(Theater theater) {
             if (theater == null) {
                 return new ArrayList<>();
             }
@@ -98,7 +108,7 @@ public class BookingSystem {
             return results;
         }
 
-        public List<Showtime> getShowtimesAtTheater(String theaterId) {
+        public synchronized List<Showtime> getShowtimesAtTheater(String theaterId) {
             if (theaterId == null || theaterId.isEmpty()) {
                 throw new IllegalArgumentException("Theater ID is required");
             }
@@ -120,15 +130,7 @@ public class BookingSystem {
                 throw new NoSuchElementException("Showtime not found: " + showtimeId);
             }
 
-            Reservation reservation = new Reservation(
-                    UUID.randomUUID().toString(),
-                    showtime,
-                    seatIds
-            );
-
-            showtime.book(reservation);
-
-            reservationsById.put(reservation.getBookingId(), reservation);
+            Reservation reservation = seatBookingService.book(showtime, seatIds);
 
             try {
                 bookingEventPublisher.publish(reservation);
@@ -137,6 +139,58 @@ public class BookingSystem {
             }
 
             return reservation;
+        }
+
+        public synchronized Showtime createShowtime(String theaterId, String movieId, String movieTitle,
+                                                     String language, LocalDateTime datetime, String screenLabel) {
+            Theater theater = findTheater(theaterId);
+            validateShowtimeDetails(movieId, movieTitle, language, datetime, screenLabel);
+            ensureNoScheduleConflict(theater, datetime, screenLabel);
+
+            Showtime showtime = new Showtime(UUID.randomUUID().toString(), theater,
+                    new Movie(movieId.trim(), movieTitle.trim(), language.trim()), datetime,
+                    screenLabel.trim());
+            theaterCatalogService.createShowtime(showtime);
+            theater.getShowtimes().add(showtime);
+            showtimesById.put(showtime.getId(), showtime);
+            return showtime;
+        }
+
+        public synchronized Theater createTheater(String name, String city) {
+            Theater theater = theaterCatalogService.createTheater(name, city);
+            theaters.add(theater);
+            return theater;
+        }
+
+        private Theater findTheater(String theaterId) {
+            if (theaterId == null || theaterId.isBlank()) {
+                throw new IllegalArgumentException("Theater ID is required");
+            }
+            return theaters.stream()
+                    .filter(theater -> theater.getId().equals(theaterId))
+                    .findFirst()
+                    .orElseThrow(() -> new NoSuchElementException("Theater not found: " + theaterId));
+        }
+
+        private void validateShowtimeDetails(String movieId, String movieTitle, String language,
+                                             LocalDateTime datetime, String screenLabel) {
+            if (movieId == null || movieId.isBlank() || movieTitle == null || movieTitle.isBlank()
+                    || language == null || language.isBlank() || screenLabel == null || screenLabel.isBlank()
+                    || datetime == null) {
+                throw new IllegalArgumentException("Movie details, showtime, and screen are required");
+            }
+            if (!datetime.isAfter(LocalDateTime.now())) {
+                throw new IllegalArgumentException("Showtime must be in the future");
+            }
+        }
+
+        private void ensureNoScheduleConflict(Theater theater, LocalDateTime datetime, String screenLabel) {
+            boolean conflict = theater.getShowtimes().stream()
+                    .anyMatch(showtime -> showtime.getDatetime().equals(datetime)
+                            && showtime.getScreenLabel().equalsIgnoreCase(screenLabel.trim()));
+            if (conflict) {
+                throw new IllegalStateException("A show is already scheduled on this screen at that time");
+            }
         }
 
         public Reservation book(String showtimeId, List<String> seatIds, String idempotencyKey) {
@@ -174,15 +228,7 @@ public class BookingSystem {
                 throw new IllegalArgumentException("Invalid confirmation ID");
             }
 
-            Reservation reservation = reservationsById.get(bookingId);
-            if (reservation == null) {
-                throw new NoSuchElementException("Reservation not found: " + bookingId);
-            }
-
-            Showtime showtime = reservation.getShowtime();
-            showtime.cancel(reservation);
-
-            reservationsById.remove(bookingId);
+            seatBookingService.cancel(bookingId);
         }
 
         public Reservation getReservation(String bookingId) {
@@ -190,12 +236,6 @@ public class BookingSystem {
                 throw new IllegalArgumentException("Invalid confirmation ID");
             }
 
-            Reservation reservation = reservationsById.get(bookingId);
-            if (reservation == null) {
-                throw new NoSuchElementException("Reservation not found: " + bookingId);
-            }
-            return reservation;
+            return seatBookingService.getReservation(bookingId, showtimesById);
         }
     }
-
-

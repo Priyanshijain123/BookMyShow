@@ -1,134 +1,78 @@
-# Proposed persistence schema
+# Database schema
 
-**Status: design only.** The current BookMyShow application uses Java collections and does not connect to a database. The following PostgreSQL design shows how to persist the same concepts and enforce seat uniqueness across app instances.
+**Implemented persistence:** JPA/Hibernate creates and updates the schema from entity mappings (`spring.jpa.hibernate.ddl-auto=update`). Local development defaults to a persistent H2 file at `./data/bookmyshow`; configure `BOOKING_DB_URL`, `BOOKING_DB_USERNAME`, and `BOOKING_DB_PASSWORD` to connect to PostgreSQL or another supported database. This project does not currently use versioned schema migrations.
+
+## Current tables
+
+The implemented tables and important constraints are:
+
+| Table | Columns and constraints |
+| --- | --- |
+| `theater_catalog` | `theater_id` primary key, `name`, `city` |
+| `showtime_catalog` | `showtime_id` primary key, `theater_id`, `movie_id`, `movie_title`, `language`, `starts_at`, `screen_label`, `screen_key`; unique `(theater_id, screen_key, starts_at)` |
+| `seat_inventory` | Generated `id` primary key, `showtime_id`, `seat_id`, `status`, nullable `booking_id`; unique `(showtime_id, seat_id)` |
+| `booking_records` | `booking_id` primary key, `showtime_id`, `status`, `created_at` |
+| `booking_seats` | `booking_id`, ordered `seat_id` values, generated `seat_order`; unique `(booking_id, seat_id)` |
+
+`showtime_catalog.screen_key` is derived from the trimmed, lower-case screen label, so schedule uniqueness is case-insensitive for screen names. The catalog entities currently store IDs as scalar columns rather than JPA foreign-key associations. Movies are represented by fields on each showtime; there is no separate movie table. The `booking_seats` table is an eager element collection owned by `BookingRecord`.
 
 ```mermaid
 erDiagram
-    MOVIES ||--o{ SHOWTIMES : shown_at
-    THEATERS ||--o{ SHOWTIMES : hosts
-    SHOWTIMES ||--o{ BOOKINGS : booked_for
-    BOOKINGS ||--|{ BOOKING_SEATS : reserves
-    BOOKINGS ||--o| BOOKING_IDEMPOTENCY : created_by
-    BOOKINGS ||--o| PAYMENTS : paid_by
-
-    MOVIES {
-        text id PK
-        text title
-        text language
+    THEATER_CATALOG {
+        varchar theater_id PK
+        varchar name
+        varchar city
     }
-    THEATERS {
-        text id PK
-        text name
-        text city
+    SHOWTIME_CATALOG {
+        varchar showtime_id PK
+        varchar theater_id
+        varchar movie_id
+        varchar movie_title
+        varchar language
+        timestamp starts_at
+        varchar screen_label
+        varchar screen_key
     }
-    SHOWTIMES {
-        text id PK
-        text movie_id FK
-        text theater_id FK
-        text screen_label
-        timestamptz starts_at
+    SEAT_INVENTORY {
+        bigint id PK
+        varchar showtime_id
+        varchar seat_id
+        varchar status
+        varchar booking_id
     }
-    BOOKINGS {
-        uuid id PK
-        text showtime_id FK
-        text status
-        timestamptz created_at
+    BOOKING_RECORDS {
+        varchar booking_id PK
+        varchar showtime_id
+        varchar status
+        timestamp created_at
     }
     BOOKING_SEATS {
-        uuid booking_id FK
-        text showtime_id FK
-        text seat_id
-        timestamptz released_at
+        varchar booking_id
+        varchar seat_id
+        integer seat_order
     }
-    BOOKING_IDEMPOTENCY {
-        text idempotency_key PK
-        text request_hash
-        text status
-        uuid booking_id FK
-    }
-    PAYMENTS {
-        uuid id PK
-        uuid booking_id FK
-        text method
-        bigint amount_minor
-        char currency
-        text gateway_reference
-        timestamptz created_at
-    }
+    THEATER_CATALOG ||--o{ SHOWTIME_CATALOG : schedules
+    SHOWTIME_CATALOG ||--o{ SEAT_INVENTORY : has_inventory
+    SHOWTIME_CATALOG ||--o{ BOOKING_RECORDS : booked_for
+    BOOKING_RECORDS ||--|{ BOOKING_SEATS : contains
 ```
 
-## PostgreSQL DDL sketch
+The diagram shows logical catalog and booking relationships. Theater/showtime, inventory/showtime, and booking/showtime IDs are scalar columns without mapped foreign-key associations; `booking_seats.booking_id` is the collection join column owned by `BookingRecord`.
 
-This SQL is a migration starting point, not a migration currently used by the project.
+## Booking and cancellation concurrency
 
-```sql
-CREATE TABLE movies (
-    id text PRIMARY KEY,
-    title text NOT NULL,
-    language text NOT NULL
-);
+On startup, the app loads theater/showtime catalog rows into an in-memory lookup and initializes inventory rows for any missing seats. Each showtime currently has rows for seats A0–Z20.
 
-CREATE TABLE theaters (
-    id text PRIMARY KEY,
-    name text NOT NULL,
-    city text NOT NULL
-);
+`SeatBookingService.book()` validates and sorts seat IDs, then `SeatInventoryRepository.lockSeats()` selects the requested rows with `@Lock(LockModeType.PESSIMISTIC_WRITE)`. Inside the same `@Transactional` method it checks that every row is available, creates the booking record, updates the seat rows, and flushes. The database holds the selected row locks until the transaction commits or rolls back. If any requested seat is already booked, the operation fails and the transaction rolls back as a unit. Different requests can proceed independently when they do not overlap seats.
 
-CREATE TABLE showtimes (
-    id text PRIMARY KEY,
-    movie_id text NOT NULL REFERENCES movies(id),
-    theater_id text NOT NULL REFERENCES theaters(id),
-    screen_label text NOT NULL,
-    starts_at timestamptz NOT NULL
-);
+Cancellation locks the booking row with `BookingRecordRepository.lockByBookingId()`, then locks its seat rows, verifies they still belong to that booking, releases them, and marks the booking cancelled in one transaction. Payment records and idempotency-key results are currently held in memory, not in these tables.
 
-CREATE TABLE bookings (
-    id uuid PRIMARY KEY,
-    showtime_id text NOT NULL REFERENCES showtimes(id),
-    status text NOT NULL CHECK (status IN ('ACTIVE', 'CANCELLED')),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (id, showtime_id)
-);
+## Scope and operational limitations
 
-CREATE TABLE booking_seats (
-    booking_id uuid NOT NULL,
-    showtime_id text NOT NULL,
-    seat_id text NOT NULL,
-    released_at timestamptz,
-    PRIMARY KEY (booking_id, seat_id),
-    FOREIGN KEY (booking_id, showtime_id)
-        REFERENCES bookings(id, showtime_id)
-);
-
-CREATE UNIQUE INDEX one_active_booking_per_seat
-    ON booking_seats (showtime_id, seat_id)
-    WHERE released_at IS NULL;
-
-CREATE TABLE booking_idempotency (
-    idempotency_key text PRIMARY KEY,
-    request_hash text NOT NULL,
-    status text NOT NULL CHECK (status IN ('IN_PROGRESS', 'SUCCEEDED')),
-    booking_id uuid UNIQUE REFERENCES bookings(id),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CHECK ((status = 'IN_PROGRESS' AND booking_id IS NULL)
-        OR (status = 'SUCCEEDED' AND booking_id IS NOT NULL))
-);
-
-CREATE TABLE payments (
-    id uuid PRIMARY KEY,
-    booking_id uuid NOT NULL UNIQUE REFERENCES bookings(id),
-    method text NOT NULL CHECK (method IN ('CARD', 'UPI')),
-    amount_minor bigint NOT NULL CHECK (amount_minor > 0),
-    currency char(3) NOT NULL,
-    gateway_reference text NOT NULL UNIQUE,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-```
-
-## Transaction rules for a database implementation
-
-1. Insert all seats for one booking in one transaction. The partial unique index rejects a second active claim on the same `(showtime_id, seat_id)` even when different app instances race.
-2. Commit the booking and successful idempotency-key result together. A retry with the same key and request hash returns that booking; a different request hash is a conflict. Expired `IN_PROGRESS` rows need recovery if a process crashes.
-3. Cancellation marks the booking `CANCELLED` and sets `released_at` for its seats in one transaction. A paid booking requires a refund workflow before cancellation.
-4. Store successful payments with one row per booking. A real gateway needs durable payment attempts, provider idempotency keys, and reconciliation for ambiguous charge results; those are outside the current simulator.
-5. The current Java model uses `LocalDateTime` without a zone. A database migration must choose an explicit time zone before writing `starts_at` as `timestamptz`.
+- Theater and showtime records, inventory, and booking records persist across restarts.
+- There are no theater or show update/delete endpoints; theater and show creation are supported.
+- Booking idempotency is only coordinated within one running application process. Persist it if retries must be safe across restarts or multiple instances.
+- Payment records are in memory, and card/UPI gateways are simulations.
+- There is no staff authentication/authorization; protect theater management endpoints before public deployment.
+- `LocalDateTime` is stored without a zone. A production schema should define the intended time zone and use an explicit zoned/UTC representation.
+- For production, replace automatic schema updates with reviewed Flyway/Liquibase migrations and connect every application instance to the same database.

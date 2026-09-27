@@ -1,9 +1,9 @@
 package bookings.controller;
 
 import bookings.payment.PaymentGatewayException;
-import bookings.service.ShowtimeBusyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -28,11 +28,10 @@ public class BookingExceptionHandler {
         return error(HttpStatus.CONFLICT, exception);
     }
 
-    @ExceptionHandler(ShowtimeBusyException.class)
-    public ResponseEntity<Map<String, String>> showtimeBusy(ShowtimeBusyException exception) {
-        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                .header("Retry-After", "1")
-                .body(Collections.singletonMap("error", exception.getMessage()));
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String, String>> dataConflict(DataIntegrityViolationException exception) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Collections.singletonMap("error", "The requested theater or show conflicts with existing data"));
     }
 
     @ExceptionHandler(PaymentGatewayException.class)
